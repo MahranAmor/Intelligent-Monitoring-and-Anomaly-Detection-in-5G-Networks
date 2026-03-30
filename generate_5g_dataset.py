@@ -1,524 +1,464 @@
 """
-Générateur de dataset synthétique pour la détection d'anomalies des réseaux 5G.
+Générateur de dataset synthétique 5G — version corrigée pour la prédiction.
 Projet PFA - Ayoub & Mahran
 
-Ce script génère un jeu de données réaliste contenant des mesures KPI 5G
-avec des échantillons normaux et anomaliques, prêt pour l'entraînement
-de modèles de détection d'anomalies.
+CORRECTIONS APPLIQUÉES vs. version originale :
+  1. Chaque cellule possède sa PROPRE série temporelle continue.
+     Les KPIs évoluent de façon cohérente dans le temps pour chaque cellule.
+  2. Corrélation temporelle via processus AR(1) :
+     value[t] = alpha * value[t-1] + (1-alpha) * target + bruit
+     → les modèles LSTM/GRU ont un vrai signal temporel à apprendre.
+  3. Les anomalies sont des ÉVÉNEMENTS TEMPORELS (durée 3-15 pas)
+     qui débutent, s'intensifient, puis se résolvent — comme en production.
+  4. Chaque cellule a un type de slice FIXE (pas tiré aléatoirement à chaque ligne).
 
 Usage:
     python3 generate_5g_dataset.py
-    python3 generate_5g_dataset.py --num-records 200000 --anomaly-ratio 0.08
+    python3 generate_5g_dataset.py --num-cells 50 --steps-per-cell 6000 --anomaly-ratio 0.05
 """
 
 import argparse
 import csv
 import os
 import random
-import uuid
 from datetime import datetime, timedelta
 
 import numpy as np
 
 # ============================================================================
-# Configuration des KPIs par type de slice (eMBB, URLLC, mMTC)
-# Chaque KPI définit : (min_normal, max_normal) pour la plage normale
+# Configuration KPI (inchangée)
 # ============================================================================
 
 KPI_CONFIG = {
-    # --- A. Latency & Delay Performance ---
     "one_way_latency_ms": {
-        "kpi_id": "KPI-1",
-        "unit": "ms",
-        "description": "One-way latency",
-        "ranges": {
-            "eMBB":  (1.0, 20.0),
-            "URLLC": (0.1, 5.0),
-            "mMTC":  (10.0, 100.0),
-        },
+        "kpi_id": "KPI-1", "unit": "ms",
+        "ranges": {"eMBB": (1.0, 20.0), "URLLC": (0.1, 5.0), "mMTC": (10.0, 100.0)},
+        "alpha": 0.85,   # smoothing factor — higher = slower changes
     },
     "jitter_ms": {
-        "kpi_id": "KPI-2",
-        "unit": "ms",
-        "description": "Variation of one-way latency",
-        "ranges": {
-            "eMBB":  (1.0, 10.0),
-            "URLLC": (0.01, 1.0),
-            "mMTC":  (5.0, 20.0),
-        },
+        "kpi_id": "KPI-2", "unit": "ms",
+        "ranges": {"eMBB": (1.0, 10.0), "URLLC": (0.01, 1.0), "mMTC": (5.0, 20.0)},
+        "alpha": 0.80,
     },
     "rtt_ms": {
-        "kpi_id": "KPI-3",
-        "unit": "ms",
-        "description": "Round Trip Time",
-        "ranges": {
-            "eMBB":  (10.0, 40.0),
-            "URLLC": (0.5, 10.0),
-            "mMTC":  (20.0, 200.0),
-        },
+        "kpi_id": "KPI-3", "unit": "ms",
+        "ranges": {"eMBB": (10.0, 40.0), "URLLC": (0.5, 10.0), "mMTC": (20.0, 200.0)},
+        "alpha": 0.85,
     },
     "packet_delay_budget_ms": {
-        "kpi_id": "KPI-18",
-        "unit": "ms",
-        "description": "Packet Delay Budget",
-        "ranges": {
-            "eMBB":  (50.0, 100.0),
-            "URLLC": (0.5, 1.0),
-            "mMTC":  (50.0, 100.0),
-        },
+        "kpi_id": "KPI-18", "unit": "ms",
+        "ranges": {"eMBB": (50.0, 100.0), "URLLC": (0.5, 1.0), "mMTC": (50.0, 100.0)},
+        "alpha": 0.90,
     },
     "handover_interruption_time_ms": {
-        "kpi_id": "KPI-16",
-        "unit": "ms",
-        "description": "Handover Interruption Time",
-        "ranges": {
-            "eMBB":  (5.0, 50.0),
-            "URLLC": (0.5, 10.0),
-            "mMTC":  (10.0, 60.0),
-        },
+        "kpi_id": "KPI-16", "unit": "ms",
+        "ranges": {"eMBB": (5.0, 50.0), "URLLC": (0.5, 10.0), "mMTC": (10.0, 60.0)},
+        "alpha": 0.80,
     },
-    # --- B. Reliability & Transmission Quality ---
     "reliability_percent": {
-        "kpi_id": "KPI-4",
-        "unit": "%",
-        "description": "Reliability (packet delivery ratio)",
-        "ranges": {
-            "eMBB":  (99.0, 100.0),
-            "URLLC": (99.999, 100.0),
-            "mMTC":  (95.0, 100.0),
-        },
+        "kpi_id": "KPI-4", "unit": "%",
+        "ranges": {"eMBB": (99.0, 100.0), "URLLC": (99.999, 100.0), "mMTC": (95.0, 100.0)},
+        "alpha": 0.92,
     },
     "packet_loss_percent": {
-        "kpi_id": "KPI-5",
-        "unit": "%",
-        "description": "Packet Loss",
-        "ranges": {
-            "eMBB":  (0.0, 1.0),
-            "URLLC": (0.0, 0.001),
-            "mMTC":  (0.0, 5.0),
-        },
+        "kpi_id": "KPI-5", "unit": "%",
+        "ranges": {"eMBB": (0.0, 1.0), "URLLC": (0.0, 0.001), "mMTC": (0.0, 5.0)},
+        "alpha": 0.78,
     },
     "packet_loss_rate_percent": {
-        "kpi_id": "KPI-10",
-        "unit": "%",
-        "description": "Packet Loss Rate",
-        "ranges": {
-            "eMBB":  (0.0, 1.0),
-            "URLLC": (0.0, 0.001),
-            "mMTC":  (0.0, 5.0),
-        },
+        "kpi_id": "KPI-10", "unit": "%",
+        "ranges": {"eMBB": (0.0, 1.0), "URLLC": (0.0, 0.001), "mMTC": (0.0, 5.0)},
+        "alpha": 0.78,
     },
     "bler_percent": {
-        "kpi_id": "KPI-14",
-        "unit": "%",
-        "description": "Block Error Rate",
-        "ranges": {
-            "eMBB":  (0.0, 10.0),
-            "URLLC": (0.0, 1.0),
-            "mMTC":  (0.0, 15.0),
-        },
+        "kpi_id": "KPI-14", "unit": "%",
+        "ranges": {"eMBB": (0.0, 10.0), "URLLC": (0.0, 1.0), "mMTC": (0.0, 15.0)},
+        "alpha": 0.80,
     },
-    # --- C. Capacity & Throughput ---
     "throughput_dl_mbps": {
-        "kpi_id": "KPI-6",
-        "unit": "Mbps",
-        "description": "Throughput Downlink",
-        "ranges": {
-            "eMBB":  (100.0, 20000.0),
-            "URLLC": (10.0, 200.0),
-            "mMTC":  (0.01, 1.0),
-        },
+        "kpi_id": "KPI-6", "unit": "Mbps",
+        "ranges": {"eMBB": (100.0, 20000.0), "URLLC": (10.0, 200.0), "mMTC": (0.01, 1.0)},
+        "alpha": 0.88,
     },
     "throughput_ul_mbps": {
-        "kpi_id": "KPI-7",
-        "unit": "Mbps",
-        "description": "Throughput Uplink / Area",
-        "ranges": {
-            "eMBB":  (50.0, 10000.0),
-            "URLLC": (10.0, 200.0),
-            "mMTC":  (0.01, 1.0),
-        },
+        "kpi_id": "KPI-7", "unit": "Mbps",
+        "ranges": {"eMBB": (50.0, 10000.0), "URLLC": (10.0, 200.0), "mMTC": (0.01, 1.0)},
+        "alpha": 0.88,
     },
     "spectral_efficiency_bps_hz": {
-        "kpi_id": "KPI-9",
-        "unit": "bits/s/Hz",
-        "description": "Spectral Efficiency",
-        "ranges": {
-            "eMBB":  (10.0, 30.0),
-            "URLLC": (5.0, 15.0),
-            "mMTC":  (1.0, 5.0),
-        },
+        "kpi_id": "KPI-9", "unit": "bits/s/Hz",
+        "ranges": {"eMBB": (10.0, 30.0), "URLLC": (5.0, 15.0), "mMTC": (1.0, 5.0)},
+        "alpha": 0.87,
     },
-    # --- D. Mobility & Network Continuity ---
     "handover_success_rate_percent": {
-        "kpi_id": "KPI-15",
-        "unit": "%",
-        "description": "Handover Success Rate",
-        "ranges": {
-            "eMBB":  (99.0, 100.0),
-            "URLLC": (99.0, 100.0),
-            "mMTC":  (99.0, 100.0),
-        },
+        "kpi_id": "KPI-15", "unit": "%",
+        "ranges": {"eMBB": (99.0, 100.0), "URLLC": (99.0, 100.0), "mMTC": (99.0, 100.0)},
+        "alpha": 0.90,
     },
-    # --- E. Energy & Efficiency ---
     "energy_efficiency_bits_per_joule": {
-        "kpi_id": "KPI-17",
-        "unit": "bits/J",
-        "description": "Energy Efficiency",
-        "ranges": {
-            "eMBB":  (1e6, 1e8),
-            "URLLC": (1e7, 1e9),
-            "mMTC":  (1e4, 1e6),
-        },
+        "kpi_id": "KPI-17", "unit": "bits/J",
+        "ranges": {"eMBB": (1e6, 1e8), "URLLC": (1e7, 1e9), "mMTC": (1e4, 1e6)},
+        "alpha": 0.88,
     },
 }
 
-# Liste des noms de colonnes KPI (dans l'ordre)
 KPI_COLUMNS = list(KPI_CONFIG.keys())
 
 # ============================================================================
-# Types d'anomalies réseau 5G
+# Types d'anomalies
 # ============================================================================
 
 ANOMALY_TYPES = [
-    "network_congestion",       # Congestion réseau
-    "interference",             # Interférence radio
-    "hardware_failure",         # Défaillance matérielle
-    "handover_failure",         # Échec de handover
-    "signal_degradation",       # Dégradation du signal
-    "security_attack",          # Attaque de sécurité (DDoS, jamming)
-    "backhaul_issue",           # Problème de backhaul
-    "overload",                 # Surcharge de la cellule
+    "network_congestion",
+    "interference",
+    "hardware_failure",
+    "handover_failure",
+    "signal_degradation",
+    "security_attack",
+    "backhaul_issue",
+    "overload",
 ]
 
+SLICE_TYPES   = ["eMBB", "URLLC", "mMTC"]
+SLICE_WEIGHTS = [0.50, 0.30, 0.20]
+
+GEO_LAT_RANGE = (33.5, 34.1)
+GEO_LON_RANGE = (-7.7, -7.4)
+
+
 # ============================================================================
-# Configuration du réseau simulé
+# Helpers
 # ============================================================================
 
-NUM_CELLS = 50           # Nombre de stations de base (gNB)
-NUM_UES = 500            # Nombre d'équipements utilisateurs
-SLICE_TYPES = ["eMBB", "URLLC", "mMTC"]
-SLICE_WEIGHTS = [0.50, 0.30, 0.20]  # Distribution des types de slice
-
-# Zone géographique simulée (région rectangulaire ~ ville)
-GEO_LAT_RANGE = (33.5, 34.1)    # Latitude (ex: Casablanca)
-GEO_LON_RANGE = (-7.7, -7.4)    # Longitude
+def _noise_std(low, high):
+    """Small noise proportional to the KPI range."""
+    return (high - low) * 0.015
 
 
-def generate_cell_topology(num_cells):
-    """Génère la topologie des cellules (stations de base gNB)."""
-    cells = []
-    for i in range(num_cells):
-        cell_id = f"gNB-{i+1:03d}"
-        lat = random.uniform(*GEO_LAT_RANGE)
-        lon = random.uniform(*GEO_LON_RANGE)
-        cells.append({"cell_id": cell_id, "lat": lat, "lon": lon})
-    return cells
+def _clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-def generate_ue_pool(num_ues):
-    """Génère un pool d'identifiants UE anonymisés."""
-    return [f"UE-{uuid.uuid4().hex[:8].upper()}" for _ in range(num_ues)]
+def _round_kpi(value, kpi_conf):
+    unit = kpi_conf["unit"]
+    if unit == "bits/J":
+        return round(value, 0)
+    elif unit == "%" and max(kpi_conf["ranges"].values(), key=lambda r: r[1])[1] <= 1.0:
+        return round(value, 6)
+    else:
+        return round(value, 4)
 
 
-def generate_normal_kpi_values(slice_type):
+# ============================================================================
+# Anomaly multipliers applied to a running KPI value
+# ============================================================================
+
+def _anomaly_multipliers(anomaly_type):
     """
-    Génère un enregistrement KPI normal pour un type de slice donné.
-    Les valeurs suivent des distributions réalistes à l'intérieur des plages normales.
+    Returns a dict of {kpi_name: multiplier} for a given anomaly type.
+    Multipliers > 1 increase the KPI, < 1 decrease it.
+    Applied progressively over the anomaly window.
     """
-    record = {}
-    for kpi_name, kpi_conf in KPI_CONFIG.items():
-        low, high = kpi_conf["ranges"][slice_type]
-
-        # Utiliser une distribution qui concentre les valeurs vers le centre
-        # avec une queue légère vers les bords (distribution beta)
-        if high > low:
-            # Distribution beta centrée (alpha=2, beta=2 -> forme en cloche)
-            beta_sample = np.random.beta(2.5, 2.5)
-            value = low + beta_sample * (high - low)
-        else:
-            value = low
-
-        # Arrondir selon l'unité
-        if kpi_conf["unit"] == "%" and high <= 1.0:
-            value = round(value, 6)
-        elif kpi_conf["unit"] == "bits/J":
-            value = round(value, 0)
-        else:
-            value = round(value, 4)
-
-        record[kpi_name] = value
-    return record
-
-
-def apply_anomaly(record, slice_type, anomaly_type):
-    """
-    Applique une anomalie réaliste à un enregistrement KPI.
-    Chaque type d'anomalie affecte un sous-ensemble spécifique de KPIs
-    avec des multiplicateurs réalistes.
-    """
-    r = record.copy()
-
+    m = {}
     if anomaly_type == "network_congestion":
-        # Latence élevée, throughput réduit, perte de paquets accrue
-        factor = random.uniform(2.0, 5.0)
-        r["one_way_latency_ms"] *= factor
-        r["rtt_ms"] *= factor
-        r["jitter_ms"] *= random.uniform(2.0, 4.0)
-        r["packet_delay_budget_ms"] *= random.uniform(1.5, 3.0)
-        r["throughput_dl_mbps"] *= random.uniform(0.1, 0.4)
-        r["throughput_ul_mbps"] *= random.uniform(0.1, 0.4)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] * random.uniform(5, 20), 50.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] * random.uniform(5, 20), 50.0)
+        m["one_way_latency_ms"]       = random.uniform(2.5, 5.0)
+        m["rtt_ms"]                   = random.uniform(2.5, 5.0)
+        m["jitter_ms"]                = random.uniform(2.0, 4.0)
+        m["packet_delay_budget_ms"]   = random.uniform(1.5, 3.0)
+        m["throughput_dl_mbps"]       = random.uniform(0.1, 0.4)
+        m["throughput_ul_mbps"]       = random.uniform(0.1, 0.4)
+        m["packet_loss_percent"]      = random.uniform(5.0, 20.0)
+        m["packet_loss_rate_percent"] = random.uniform(5.0, 20.0)
 
     elif anomaly_type == "interference":
-        # BLER élevé, efficacité spectrale réduite, throughput impacté
-        r["bler_percent"] = min(r["bler_percent"] * random.uniform(3, 8), 80.0)
-        r["spectral_efficiency_bps_hz"] *= random.uniform(0.2, 0.5)
-        r["throughput_dl_mbps"] *= random.uniform(0.2, 0.5)
-        r["throughput_ul_mbps"] *= random.uniform(0.3, 0.6)
-        r["jitter_ms"] *= random.uniform(1.5, 3.0)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] + random.uniform(2, 10), 40.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] + random.uniform(2, 10), 40.0)
+        m["bler_percent"]                  = random.uniform(4.0, 8.0)
+        m["spectral_efficiency_bps_hz"]    = random.uniform(0.2, 0.5)
+        m["throughput_dl_mbps"]            = random.uniform(0.2, 0.5)
+        m["throughput_ul_mbps"]            = random.uniform(0.3, 0.6)
+        m["jitter_ms"]                     = random.uniform(1.5, 3.0)
+        m["packet_loss_percent"]           = random.uniform(3.0, 10.0)
+        m["packet_loss_rate_percent"]      = random.uniform(3.0, 10.0)
 
     elif anomaly_type == "hardware_failure":
-        # Dégradation sévère de tous les métriques
-        r["reliability_percent"] = max(r["reliability_percent"] * random.uniform(0.85, 0.95), 50.0)
-        r["throughput_dl_mbps"] *= random.uniform(0.05, 0.2)
-        r["throughput_ul_mbps"] *= random.uniform(0.05, 0.2)
-        r["one_way_latency_ms"] *= random.uniform(5, 15)
-        r["rtt_ms"] *= random.uniform(5, 15)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] + random.uniform(10, 30), 60.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] + random.uniform(10, 30), 60.0)
-        r["bler_percent"] = min(r["bler_percent"] + random.uniform(20, 50), 90.0)
-        r["energy_efficiency_bits_per_joule"] *= random.uniform(0.1, 0.3)
+        m["reliability_percent"]           = random.uniform(0.85, 0.95)
+        m["throughput_dl_mbps"]            = random.uniform(0.05, 0.2)
+        m["throughput_ul_mbps"]            = random.uniform(0.05, 0.2)
+        m["one_way_latency_ms"]            = random.uniform(5.0, 15.0)
+        m["rtt_ms"]                        = random.uniform(5.0, 15.0)
+        m["packet_loss_percent"]           = random.uniform(10.0, 30.0)
+        m["packet_loss_rate_percent"]      = random.uniform(10.0, 30.0)
+        m["bler_percent"]                  = random.uniform(5.0, 10.0)
+        m["energy_efficiency_bits_per_joule"] = random.uniform(0.1, 0.3)
 
     elif anomaly_type == "handover_failure":
-        # Échec de handover, interruption prolongée
-        r["handover_success_rate_percent"] = max(
-            r["handover_success_rate_percent"] - random.uniform(10, 40), 40.0
-        )
-        r["handover_interruption_time_ms"] *= random.uniform(5, 20)
-        r["one_way_latency_ms"] *= random.uniform(2, 6)
-        r["rtt_ms"] *= random.uniform(2, 6)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] + random.uniform(3, 15), 40.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] + random.uniform(3, 15), 40.0)
+        m["handover_success_rate_percent"] = random.uniform(0.6, 0.85)
+        m["handover_interruption_time_ms"] = random.uniform(5.0, 20.0)
+        m["one_way_latency_ms"]            = random.uniform(2.0, 6.0)
+        m["rtt_ms"]                        = random.uniform(2.0, 6.0)
+        m["packet_loss_percent"]           = random.uniform(3.0, 15.0)
+        m["packet_loss_rate_percent"]      = random.uniform(3.0, 15.0)
 
     elif anomaly_type == "signal_degradation":
-        # Dégradation progressive du signal
-        r["spectral_efficiency_bps_hz"] *= random.uniform(0.3, 0.6)
-        r["throughput_dl_mbps"] *= random.uniform(0.3, 0.6)
-        r["throughput_ul_mbps"] *= random.uniform(0.3, 0.6)
-        r["bler_percent"] = min(r["bler_percent"] * random.uniform(2, 5), 60.0)
-        r["reliability_percent"] = max(r["reliability_percent"] - random.uniform(2, 8), 70.0)
-        r["jitter_ms"] *= random.uniform(1.5, 3.0)
+        m["spectral_efficiency_bps_hz"]    = random.uniform(0.3, 0.6)
+        m["throughput_dl_mbps"]            = random.uniform(0.3, 0.6)
+        m["throughput_ul_mbps"]            = random.uniform(0.3, 0.6)
+        m["bler_percent"]                  = random.uniform(2.0, 5.0)
+        m["reliability_percent"]           = random.uniform(0.93, 0.98)
+        m["jitter_ms"]                     = random.uniform(1.5, 3.0)
 
     elif anomaly_type == "security_attack":
-        # DDoS / Jamming : latence extrême, perte massive
-        r["one_way_latency_ms"] *= random.uniform(10, 50)
-        r["rtt_ms"] *= random.uniform(10, 50)
-        r["jitter_ms"] *= random.uniform(5, 20)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] + random.uniform(20, 50), 80.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] + random.uniform(20, 50), 80.0)
-        r["throughput_dl_mbps"] *= random.uniform(0.01, 0.1)
-        r["throughput_ul_mbps"] *= random.uniform(0.01, 0.1)
-        r["reliability_percent"] = max(r["reliability_percent"] - random.uniform(10, 30), 30.0)
+        m["one_way_latency_ms"]            = random.uniform(10.0, 50.0)
+        m["rtt_ms"]                        = random.uniform(10.0, 50.0)
+        m["jitter_ms"]                     = random.uniform(5.0, 20.0)
+        m["packet_loss_percent"]           = random.uniform(20.0, 50.0)
+        m["packet_loss_rate_percent"]      = random.uniform(20.0, 50.0)
+        m["throughput_dl_mbps"]            = random.uniform(0.01, 0.1)
+        m["throughput_ul_mbps"]            = random.uniform(0.01, 0.1)
+        m["reliability_percent"]           = random.uniform(0.70, 0.90)
 
     elif anomaly_type == "backhaul_issue":
-        # Problème de liaison backhaul : latence élevée, throughput réduit
-        r["one_way_latency_ms"] *= random.uniform(3, 10)
-        r["rtt_ms"] *= random.uniform(3, 10)
-        r["packet_delay_budget_ms"] *= random.uniform(2, 5)
-        r["throughput_dl_mbps"] *= random.uniform(0.1, 0.3)
-        r["throughput_ul_mbps"] *= random.uniform(0.1, 0.3)
-        r["jitter_ms"] *= random.uniform(3, 8)
+        m["one_way_latency_ms"]            = random.uniform(3.0, 10.0)
+        m["rtt_ms"]                        = random.uniform(3.0, 10.0)
+        m["packet_delay_budget_ms"]        = random.uniform(2.0, 5.0)
+        m["throughput_dl_mbps"]            = random.uniform(0.1, 0.3)
+        m["throughput_ul_mbps"]            = random.uniform(0.1, 0.3)
+        m["jitter_ms"]                     = random.uniform(3.0, 8.0)
 
     elif anomaly_type == "overload":
-        # Surcharge cellule : dégradation modérée mais étendue
-        r["throughput_dl_mbps"] *= random.uniform(0.2, 0.5)
-        r["throughput_ul_mbps"] *= random.uniform(0.2, 0.5)
-        r["one_way_latency_ms"] *= random.uniform(2, 4)
-        r["rtt_ms"] *= random.uniform(2, 4)
-        r["packet_loss_percent"] = min(r["packet_loss_percent"] + random.uniform(1, 8), 30.0)
-        r["packet_loss_rate_percent"] = min(r["packet_loss_rate_percent"] + random.uniform(1, 8), 30.0)
-        r["bler_percent"] = min(r["bler_percent"] * random.uniform(1.5, 3), 40.0)
-        r["reliability_percent"] = max(r["reliability_percent"] - random.uniform(1, 5), 80.0)
+        m["throughput_dl_mbps"]            = random.uniform(0.2, 0.5)
+        m["throughput_ul_mbps"]            = random.uniform(0.2, 0.5)
+        m["one_way_latency_ms"]            = random.uniform(2.0, 4.0)
+        m["rtt_ms"]                        = random.uniform(2.0, 4.0)
+        m["packet_loss_percent"]           = random.uniform(1.0, 8.0)
+        m["packet_loss_rate_percent"]      = random.uniform(1.0, 8.0)
+        m["bler_percent"]                  = random.uniform(2.0, 4.0)
+        m["reliability_percent"]           = random.uniform(0.95, 0.99)
 
-    # Arrondir toutes les valeurs
-    for kpi_name, kpi_conf in KPI_CONFIG.items():
-        if kpi_conf["unit"] == "bits/J":
-            r[kpi_name] = round(r[kpi_name], 0)
-        elif kpi_conf["unit"] == "%" and kpi_conf["ranges"][slice_type][1] <= 1.0:
-            r[kpi_name] = round(r[kpi_name], 6)
-        else:
-            r[kpi_name] = round(r[kpi_name], 4)
-
-    return r
+    return m
 
 
-def generate_dataset(num_records, anomaly_ratio, seed=42):
+# ============================================================================
+# Per-cell time series generator
+# ============================================================================
+
+def generate_cell_series(slice_type, timestamps):
     """
-    Génère le dataset complet.
+    Generates a full time series for a single cell.
 
-    Args:
-        num_records: Nombre total d'enregistrements à générer
-        anomaly_ratio: Proportion d'anomalies (ex: 0.05 = 5%)
-        seed: Graine pour la reproductibilité
+    Strategy:
+    - KPI values evolve via AR(1): v[t] = alpha * v[t-1] + (1-alpha) * mean + noise
+    - Anomaly events are temporal windows (3–15 timesteps) where multipliers
+      are applied smoothly (ramp-up / ramp-down) to simulate realistic network events.
+    - Each cell gets a FIXED slice_type for the entire series.
+    """
+    T = len(timestamps)
 
-    Returns:
-        Liste de dictionnaires représentant les enregistrements
+    # ── 1. Initialize KPI state at the midpoint of normal range ──────────────
+    state = {}
+    for kpi, conf in KPI_CONFIG.items():
+        low, high = conf["ranges"][slice_type]
+        state[kpi] = low + (high - low) * 0.5  # start at midpoint
+
+    # ── 2. Schedule anomaly windows ──────────────────────────────────────────
+    #   Each anomaly: (start_step, duration, anomaly_type)
+    #   Windows never overlap. Min gap between events = 10 steps.
+    anomaly_schedule = []   # list of (start, end, atype)
+    occupied = np.zeros(T, dtype=bool)
+
+    # Target ~5% anomaly coverage across the time series
+    target_anomaly_steps = int(T * 0.05)
+    attempts = 0
+    total_scheduled = 0
+
+    while total_scheduled < target_anomaly_steps and attempts < 500:
+        duration   = random.randint(3, 15)
+        start      = random.randint(10, T - duration - 10)
+        end        = start + duration
+        gap_start  = max(0, start - 10)
+        gap_end    = min(T, end + 10)
+
+        if not occupied[gap_start:gap_end].any():
+            atype = random.choice(ANOMALY_TYPES)
+            anomaly_schedule.append((start, end, atype))
+            occupied[start:end] = True
+            total_scheduled += duration
+
+        attempts += 1
+
+    # Build per-step anomaly label array
+    step_anomaly      = ["normal"] * T
+    step_is_anomaly   = [0] * T
+    for (start, end, atype) in anomaly_schedule:
+        for t in range(start, end):
+            step_anomaly[t]    = atype
+            step_is_anomaly[t] = 1
+
+    # ── 3. Generate the time series step by step ──────────────────────────────
+    rows = []
+
+    for t in range(T):
+        # Base AR(1) update for each KPI
+        new_state = {}
+        for kpi, conf in KPI_CONFIG.items():
+            low, high   = conf["ranges"][slice_type]
+            alpha       = conf["alpha"]
+            mean_val    = low + (high - low) * 0.5
+            noise       = np.random.normal(0, _noise_std(low, high))
+            new_val     = alpha * state[kpi] + (1 - alpha) * mean_val + noise
+            new_state[kpi] = _clamp(new_val, low * 0.5, high * 2.0)
+
+        # Apply anomaly multipliers if inside an anomaly window
+        atype = step_anomaly[t]
+        if atype != "normal":
+            # Find which window we're in to compute ramp factor (0→1→0)
+            for (start, end, ev_type) in anomaly_schedule:
+                if start <= t < end and ev_type == atype:
+                    window_len  = end - start
+                    pos         = t - start
+                    # Smooth ramp: rises in first 30%, peaks, drops in last 30%
+                    ramp_frac   = min(pos / max(window_len * 0.3, 1),
+                                      (window_len - 1 - pos) / max(window_len * 0.3, 1), 1.0)
+                    mults = _anomaly_multipliers(atype)
+                    for kpi, mult in mults.items():
+                        low, high = KPI_CONFIG[kpi]["ranges"][slice_type]
+                        base      = new_state[kpi]
+                        # Interpolate between normal and full anomaly value
+                        target    = base * mult
+                        new_state[kpi] = _clamp(
+                            base + ramp_frac * (target - base),
+                            low * 0.01, high * 60.0
+                        )
+                    break
+
+        state = new_state
+
+        # Build row
+        ts = timestamps[t]
+        row = {
+            "timestamp" : ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "slice_type": slice_type,
+            "latitude"  : round(random.gauss(33.8, 0.005), 6),
+            "longitude" : round(random.gauss(-7.55, 0.005), 6),
+        }
+        for kpi, conf in KPI_CONFIG.items():
+            row[kpi] = _round_kpi(state[kpi], conf)
+
+        row["anomaly"]      = step_is_anomaly[t]
+        row["anomaly_type"] = atype
+
+        rows.append(row)
+
+    return rows
+
+
+# ============================================================================
+# Main dataset generator
+# ============================================================================
+
+def generate_dataset(steps, anomaly_ratio, seed=42, start_date="2024-01-01"):
+    """
+    Generates a single continuous time series.
+    Total rows = steps  (one row every 5 minutes).
     """
     random.seed(seed)
     np.random.seed(seed)
 
-    cells = generate_cell_topology(NUM_CELLS)
-    ue_pool = generate_ue_pool(NUM_UES)
+    start_time = datetime.strptime(start_date, "%Y-%m-%d")
+    time_step  = timedelta(minutes=5)
+    timestamps = [start_time + time_step * t for t in range(steps)]
 
-    # Période de collecte : 30 jours avec un pas de 5 minutes
-    start_time = datetime(2024, 1, 1, 0, 0, 0)
-    time_step = timedelta(minutes=5)
+    slice_type = random.choices(SLICE_TYPES, weights=SLICE_WEIGHTS, k=1)[0]
+    print(f"  Slice type : {slice_type}")
+    print(f"  Generating {steps:,} timesteps ...")
 
-    num_anomalies = int(num_records * anomaly_ratio)
-    num_normal = num_records - num_anomalies
+    dataset        = generate_cell_series(slice_type, timestamps)
+    total_anomalies = sum(r["anomaly"] for r in dataset)
 
-    # Indices des enregistrements anomaliques (aléatoires)
-    anomaly_indices = set(random.sample(range(num_records), num_anomalies))
+    return dataset, total_anomalies
 
-    dataset = []
 
-    for i in range(num_records):
-        # Timestamp avec léger bruit
-        timestamp = start_time + time_step * i + timedelta(seconds=random.randint(-30, 30))
-
-        # Sélection aléatoire de la cellule, UE et slice
-        cell = random.choice(cells)
-        ue_id = random.choice(ue_pool)
-        slice_type = random.choices(SLICE_TYPES, weights=SLICE_WEIGHTS, k=1)[0]
-
-        # Coordonnées UE : proches de la cellule avec bruit gaussien
-        ue_lat = cell["lat"] + np.random.normal(0, 0.005)
-        ue_lon = cell["lon"] + np.random.normal(0, 0.005)
-
-        # Générer les valeurs KPI normales
-        kpi_values = generate_normal_kpi_values(slice_type)
-
-        # Déterminer si cet enregistrement est anomalique
-        is_anomaly = i in anomaly_indices
-        anomaly_type = "normal"
-
-        if is_anomaly:
-            anomaly_type = random.choice(ANOMALY_TYPES)
-            kpi_values = apply_anomaly(kpi_values, slice_type, anomaly_type)
-
-        # Construire l'enregistrement
-        record = {
-            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "cell_id": cell["cell_id"],
-            "ue_id": ue_id,
-            "slice_type": slice_type,
-            "latitude": round(ue_lat, 6),
-            "longitude": round(ue_lon, 6),
-        }
-        record.update(kpi_values)
-        record["anomaly"] = 1 if is_anomaly else 0
-        record["anomaly_type"] = anomaly_type
-
-        dataset.append(record)
-
-        if (i + 1) % 50000 == 0:
-            print(f"  {i + 1:,} / {num_records:,} enregistrements générés...")
-
-    return dataset
-
+# ============================================================================
+# I/O helpers
+# ============================================================================
 
 def save_to_csv(dataset, output_path):
-    """Sauvegarde le dataset au format CSV."""
     if not dataset:
-        print("Aucun enregistrement à sauvegarder.")
+        print("No records to save.")
         return
-
     fieldnames = list(dataset[0].keys())
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(dataset)
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"\nSaved: {output_path}  ({size_mb:.1f} MB)")
 
-    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"Dataset sauvegardé : {output_path} ({file_size_mb:.1f} Mo)")
 
-
-def print_summary(dataset):
-    """Affiche un résumé du dataset généré."""
+def print_summary(dataset, total_anomalies):
     total = len(dataset)
-    anomalies = sum(1 for r in dataset if r["anomaly"] == 1)
-    normal = total - anomalies
-
     print("\n" + "=" * 60)
-    print("RÉSUMÉ DU DATASET GÉNÉRÉ")
+    print("DATASET SUMMARY")
     print("=" * 60)
-    print(f"  Total d'enregistrements : {total:,}")
-    print(f"  Enregistrements normaux : {normal:,} ({normal/total*100:.1f}%)")
-    print(f"  Anomalies               : {anomalies:,} ({anomalies/total*100:.1f}%)")
+    print(f"  Total rows   : {total:,}")
+    print(f"  Normal rows  : {total - total_anomalies:,}  ({(total-total_anomalies)/total*100:.1f}%)")
+    print(f"  Anomaly rows : {total_anomalies:,}  ({total_anomalies/total*100:.1f}%)")
+    print(f"  Slice type   : {dataset[0]['slice_type']}")
 
-    # Distribution des types de slice
-    print(f"\n  Distribution des slices :")
-    for st in SLICE_TYPES:
-        count = sum(1 for r in dataset if r["slice_type"] == st)
-        print(f"    {st:6s} : {count:,} ({count/total*100:.1f}%)")
-
-    # Distribution des types d'anomalies
-    print(f"\n  Distribution des anomalies :")
-    anomaly_counts = {}
+    print(f"\n  Anomaly type distribution:")
+    ac = {}
     for r in dataset:
         if r["anomaly"] == 1:
-            at = r["anomaly_type"]
-            anomaly_counts[at] = anomaly_counts.get(at, 0) + 1
-    for at, count in sorted(anomaly_counts.items(), key=lambda x: -x[1]):
-        print(f"    {at:25s} : {count:,} ({count/anomalies*100:.1f}%)")
+            ac[r["anomaly_type"]] = ac.get(r["anomaly_type"], 0) + 1
+    for at, cnt in sorted(ac.items(), key=lambda x: -x[1]):
+        print(f"    {at:28s}: {cnt:,}  ({cnt/total_anomalies*100:.1f}%)")
 
-    # Aperçu des colonnes
-    print(f"\n  Colonnes ({len(dataset[0])} total) :")
-    print(f"    Dimensions : timestamp, cell_id, ue_id, slice_type, latitude, longitude")
+    print(f"\n  Columns ({len(dataset[0])}):")
+    print(f"    Dimensions : timestamp, slice_type, latitude, longitude")
     print(f"    KPIs ({len(KPI_COLUMNS)}) : {', '.join(KPI_COLUMNS)}")
     print(f"    Labels     : anomaly, anomaly_type")
     print("=" * 60)
 
 
+# ============================================================================
+# Entry point
+# ============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Générateur de dataset synthétique 5G pour la détection d'anomalies"
+        description="5G synthetic dataset generator — single time series"
     )
-    parser.add_argument(
-        "--num-records", type=int, default=300000,
-        help="Nombre total d'enregistrements (défaut: 100000)"
-    )
-    parser.add_argument(
-        "--anomaly-ratio", type=float, default=0.05,
-        help="Proportion d'anomalies, entre 0 et 1 (défaut: 0.05 = 5%%)"
-    )
-    parser.add_argument(
-        "--output", type=str, default="5g_anomaly_dataset.csv",
-        help="Chemin du fichier CSV de sortie (défaut: 5g_anomaly_dataset.csv)"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Graine aléatoire pour la reproductibilité (défaut: 42)"
-    )
+    parser.add_argument("--start-date",    type=str,   default="2024-01-01",
+                        help="Start date YYYY-MM-DD (default: 2024-01-01)")
+    parser.add_argument("--end-date",      type=str,   default="2026-01-01",
+                        help="End date YYYY-MM-DD (default: 2026-01-01)")
+    parser.add_argument("--anomaly-ratio", type=float, default=0.05,
+                        help="Target anomaly fraction (default: 0.05)")
+    parser.add_argument("--output",        type=str,   default="5g_timeseries_dataset.csv",
+                        help="Output CSV file path")
+    parser.add_argument("--seed",          type=int,   default=42)
 
     args = parser.parse_args()
 
+    start_dt      = datetime.strptime(args.start_date, "%Y-%m-%d")
+    end_dt        = datetime.strptime(args.end_date,   "%Y-%m-%d")
+    total_minutes = int((end_dt - start_dt).total_seconds() / 60)
+    steps         = total_minutes // 5
+    total_days    = (end_dt - start_dt).days
+
     print("=" * 60)
-    print("GÉNÉRATION DU DATASET 5G - DÉTECTION D'ANOMALIES")
+    print("5G DATASET GENERATOR — SINGLE TIME SERIES")
     print("=" * 60)
-    print(f"  Enregistrements : {args.num_records:,}")
-    print(f"  Ratio anomalies : {args.anomaly_ratio*100:.1f}%")
-    print(f"  Fichier sortie  : {args.output}")
-    print(f"  Seed            : {args.seed}")
+    print(f"  Date range     : {args.start_date}  →  {args.end_date}  ({total_days} days)")
+    print(f"  Total steps    : {steps:,}  (5-min intervals)")
+    print(f"  Anomaly target : {args.anomaly_ratio*100:.1f}%")
+    print(f"  Output         : {args.output}")
     print()
 
-    dataset = generate_dataset(args.num_records, args.anomaly_ratio, args.seed)
+    dataset, total_anomalies = generate_dataset(
+        steps, args.anomaly_ratio, args.seed, start_date=args.start_date
+    )
     save_to_csv(dataset, args.output)
-    print_summary(dataset)
+    print_summary(dataset, total_anomalies)
 
 
 if __name__ == "__main__":
