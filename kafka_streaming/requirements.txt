@@ -1,5 +1,0 @@
-kafka-python
-scikit-learn
-pandas
-joblib
-numpy
