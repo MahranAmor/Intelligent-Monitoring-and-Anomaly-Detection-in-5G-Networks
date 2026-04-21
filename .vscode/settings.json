@@ -1,3 +1,4 @@
 {
-    "claudeCode.respectGitIgnore": false
+  "claudeCode.respectGitIgnore": false,
+  "git.ignoreLimitWarning": true
 }

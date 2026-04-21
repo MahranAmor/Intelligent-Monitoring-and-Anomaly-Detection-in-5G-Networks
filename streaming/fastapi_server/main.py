@@ -53,6 +53,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             cell_id TEXT,
+            ue_id TEXT,
             slice_type TEXT,
             latitude REAL,
             longitude REAL,
@@ -91,6 +92,10 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Back-compat: add ue_id column to existing DBs.
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()]
+    if "ue_id" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN ue_id TEXT")
     conn.commit()
     conn.close()
     print("[FastAPI] Database initialised.", flush=True)
@@ -99,7 +104,7 @@ def init_db():
 def insert_prediction(conn: sqlite3.Connection, record: dict):
     conn.execute("""
         INSERT INTO predictions (
-            timestamp, cell_id, slice_type, latitude, longitude,
+            timestamp, cell_id, ue_id, slice_type, latitude, longitude,
             one_way_latency_ms, jitter_ms, rtt_ms,
             throughput_dl_mbps, throughput_ul_mbps,
             packet_loss_percent, reliability_percent, bler_percent,
@@ -108,7 +113,7 @@ def insert_prediction(conn: sqlite3.Connection, record: dict):
             ml_anomaly_type, ml_anomaly_type_confidence,
             actual_anomaly, actual_anomaly_type
         ) VALUES (
-            :timestamp, :cell_id, :slice_type, :latitude, :longitude,
+            :timestamp, :cell_id, :ue_id, :slice_type, :latitude, :longitude,
             :one_way_latency_ms, :jitter_ms, :rtt_ms,
             :throughput_dl_mbps, :throughput_ul_mbps,
             :packet_loss_percent, :reliability_percent, :bler_percent,
@@ -118,7 +123,7 @@ def insert_prediction(conn: sqlite3.Connection, record: dict):
             :actual_anomaly, :actual_anomaly_type
         )
     """, {k: record.get(k) for k in [
-        "timestamp", "cell_id", "slice_type", "latitude", "longitude",
+        "timestamp", "cell_id", "ue_id", "slice_type", "latitude", "longitude",
         "one_way_latency_ms", "jitter_ms", "rtt_ms",
         "throughput_dl_mbps", "throughput_ul_mbps",
         "packet_loss_percent", "reliability_percent", "bler_percent",
@@ -283,6 +288,7 @@ def get_predictions(
     slice_type: Optional[str] = None,
     cell_id: Optional[str] = None,
     anomaly_only: bool = False,
+    anomaly_source: str = "ml",  # "ml" or "actual"
     limit: int = Query(default=1000, le=50000),
     offset: int = 0,
     start_time: Optional[str] = None,
@@ -298,7 +304,8 @@ def get_predictions(
         clauses.append("cell_id = ?")
         params.append(cell_id)
     if anomaly_only:
-        clauses.append("ml_prediction = 1")
+        col = "actual_anomaly" if anomaly_source == "actual" else "ml_prediction"
+        clauses.append(f"{col} = 1")
     if start_time:
         clauses.append("timestamp >= ?")
         params.append(start_time)
@@ -368,7 +375,7 @@ def get_alerts(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params += [limit, offset]
     rows = conn.execute(
-        f"SELECT * FROM alerts {where} ORDER BY alert_time DESC LIMIT ? OFFSET ?",
+        f"SELECT * FROM alerts {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         params,
     ).fetchall()
     conn.close()
@@ -432,20 +439,31 @@ def get_sla_status(
 
 @app.get("/api/network-health")
 def get_network_health():
+    """Cell health based on ground-truth `actual_anomaly` (dataset label).
+
+    The ML model is a separate concern and shown on the Anomaly Diagnosis page.
+    Health here reflects what the network is *really* experiencing.
+    """
     conn = get_db()
 
-    # Per-cell anomaly counts for the last 24h
-    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
     cell_rows = conn.execute(
         """SELECT cell_id,
                   COUNT(*) AS total,
-                  SUM(ml_prediction) AS anomaly_count,
-                  MAX(ml_anomaly_type) AS dominant_anomaly_type
+                  SUM(actual_anomaly) AS anomaly_count,
+                  MAX(actual_anomaly_type) AS dominant_anomaly_type,
+                  COUNT(DISTINCT ue_id) AS ue_count
            FROM predictions
-           WHERE timestamp >= ?
-           GROUP BY cell_id""",
-        (cutoff,),
+           WHERE ingested_at >= datetime('now', '-24 hours')
+           GROUP BY cell_id"""
     ).fetchall()
+
+    ue_row = conn.execute(
+        """SELECT COUNT(DISTINCT ue_id) AS active_ues,
+                  COUNT(*) AS total_records
+           FROM predictions
+           WHERE ingested_at >= datetime('now', '-24 hours')
+             AND ue_id IS NOT NULL"""
+    ).fetchone()
     conn.close()
 
     cells = []
@@ -455,10 +473,11 @@ def get_network_health():
         d = dict(r)
         total = d["total"] or 1
         rate = (d["anomaly_count"] or 0) / total
-        if rate == 0:
+        # Tuned for the dataset's ~5% baseline anomaly rate.
+        if rate < 0.02:
             status = "Healthy"
             healthy += 1
-        elif rate < 0.2:
+        elif rate < 0.07:
             status = "Degraded"
             degraded += 1
         else:
@@ -470,6 +489,8 @@ def get_network_health():
 
     return {
         "total_cells": len(cells),
+        "active_ues": ue_row["active_ues"] if ue_row else 0,
+        "total_records": ue_row["total_records"] if ue_row else 0,
         "healthy": healthy,
         "degraded": degraded,
         "critical": critical,
@@ -483,15 +504,14 @@ def get_anomaly_timeline(
     slice_type: Optional[str] = None,
 ):
     conn = get_db()
-    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    clauses = ["timestamp >= ?"]
-    params: list = [cutoff]
+    clauses = ["ingested_at >= datetime('now', ?)"]
+    params: list = [f"-{hours} hours"]
     if slice_type:
         clauses.append("slice_type = ?")
         params.append(slice_type)
     where = "WHERE " + " AND ".join(clauses)
     rows = conn.execute(
-        f"""SELECT strftime('%H:00', timestamp) AS hour,
+        f"""SELECT strftime('%H:00', ingested_at) AS hour,
                    slice_type,
                    SUM(ml_prediction) AS anomaly_count,
                    COUNT(*) AS total
@@ -502,6 +522,260 @@ def get_anomaly_timeline(
     ).fetchall()
     conn.close()
     return rows_to_dicts(rows)
+
+
+@app.get("/api/anomaly-summary")
+def get_anomaly_summary(
+    slice_type: Optional[str] = None,
+    cell_id: Optional[str] = None,
+    hours: int = 24,
+):
+    conn = get_db()
+    clauses = ["ingested_at >= datetime('now', ?)"]
+    params: list = [f"-{hours} hours"]
+    if slice_type:
+        clauses.append("slice_type = ?")
+        params.append(slice_type)
+    if cell_id:
+        clauses.append("cell_id = ?")
+        params.append(cell_id)
+    where = "WHERE " + " AND ".join(clauses)
+
+    kpi_rows = conn.execute(
+        f"""SELECT COUNT(*) AS total,
+                   SUM(ml_prediction) AS active_anomalies,
+                   COUNT(DISTINCT cell_id) AS affected_cells,
+                   COUNT(DISTINCT ue_id) AS affected_ues
+            FROM predictions {where}""",
+        params,
+    ).fetchone()
+    anom_where = where + " AND ml_prediction = 1"
+    type_rows = conn.execute(
+        f"""SELECT ml_anomaly_type, COUNT(*) AS count
+            FROM predictions {anom_where}
+            GROUP BY ml_anomaly_type
+            ORDER BY count DESC""",
+        params,
+    ).fetchall()
+
+    cell_rows = conn.execute(
+        f"""SELECT cell_id,
+                   COUNT(*) AS total,
+                   SUM(ml_prediction) AS anomaly_count
+            FROM predictions {where}
+            GROUP BY cell_id""",
+        params,
+    ).fetchall()
+
+    dominant_type_rows = conn.execute(
+        f"""SELECT cell_id, ml_anomaly_type, COUNT(*) AS cnt
+            FROM predictions {anom_where}
+            GROUP BY cell_id, ml_anomaly_type""",
+        params,
+    ).fetchall()
+    dominant_by_cell = {}
+    for r in dominant_type_rows:
+        d = dict(r)
+        cur = dominant_by_cell.get(d["cell_id"])
+        if cur is None or d["cnt"] > cur["cnt"]:
+            dominant_by_cell[d["cell_id"]] = d
+
+    severity_ranking = []
+    for r in cell_rows:
+        d = dict(r)
+        total = d["total"] or 1
+        rate = (d["anomaly_count"] or 0) / total
+        if rate >= 0.2:
+            severity = "Critical"
+        elif rate >= 0.05:
+            severity = "Medium"
+        else:
+            severity = "Low"
+        dom = dominant_by_cell.get(d["cell_id"])
+        severity_ranking.append({
+            "cell_id": d["cell_id"],
+            "dominant_anomaly_type": dom["ml_anomaly_type"] if dom else None,
+            "anomaly_rate": round(rate, 4),
+            "anomaly_count": d["anomaly_count"] or 0,
+            "severity": severity,
+        })
+    severity_ranking.sort(key=lambda x: x["anomaly_count"], reverse=True)
+
+    # Approximate duration: rows are ~1 second apart → count ≈ seconds
+    # Return in minutes for display
+    active_anomalies = kpi_rows["active_anomalies"] or 0
+    avg_anomaly_duration_min = round((active_anomalies / max(len(dominant_by_cell), 1)) / 60.0, 2)
+
+    type_distribution = [dict(r) for r in type_rows]
+    dominant_type = type_distribution[0]["ml_anomaly_type"] if type_distribution else None
+
+    conn.close()
+    return {
+        "active_anomalies": active_anomalies,
+        "dominant_anomaly_type": dominant_type,
+        "affected_cells": kpi_rows["affected_cells"] or 0,
+        "affected_ues": kpi_rows["affected_ues"] or 0,
+        "avg_anomaly_duration_min": avg_anomaly_duration_min,
+        "type_distribution": type_distribution,
+        "severity_ranking": severity_ranking[:20],
+    }
+
+
+@app.get("/api/anomaly-timeline-by-type")
+def get_anomaly_timeline_by_type(
+    hours: int = 24,
+    slice_type: Optional[str] = None,
+):
+    conn = get_db()
+    clauses = ["ingested_at >= datetime('now', ?)", "ml_prediction = 1"]
+    params: list = [f"-{hours} hours"]
+    if slice_type:
+        clauses.append("slice_type = ?")
+        params.append(slice_type)
+    where = "WHERE " + " AND ".join(clauses)
+    rows = conn.execute(
+        f"""SELECT strftime('%H:00', ingested_at) AS hour,
+                   ml_anomaly_type,
+                   COUNT(*) AS count
+            FROM predictions {where}
+            GROUP BY hour, ml_anomaly_type
+            ORDER BY hour""",
+        params,
+    ).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+
+@app.get("/api/sla-breach-trend")
+def get_sla_breach_trend(hours: int = 24):
+    """SLA breaches grouped by hour. Returns a 'bucket' string label per row."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT strftime('%Y-%m-%d %H:00', created_at) AS bucket,
+                  slice_type,
+                  COUNT(*) AS breach_count
+           FROM alerts
+           WHERE created_at >= datetime('now', ?)
+           GROUP BY bucket, slice_type
+           ORDER BY bucket""",
+        (f"-{hours} hours",),
+    ).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+
+@app.get("/api/cells")
+def list_cells():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT cell_id FROM predictions WHERE cell_id IS NOT NULL ORDER BY cell_id"
+    ).fetchall()
+    conn.close()
+    return [r["cell_id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Forecasting (naive linear trend — swap in BiLSTM later)
+# ---------------------------------------------------------------------------
+
+FORECASTABLE_KPIS = {
+    "one_way_latency_ms":              {"direction": "max", "unit": "ms"},
+    "bler_percent":                    {"direction": "max", "unit": "%"},
+    "throughput_dl_mbps":              {"direction": "min", "unit": "Mbps"},
+    "handover_success_rate_percent":   {"direction": "min", "unit": "%"},
+}
+
+
+@app.get("/api/forecast/{kpi}")
+def get_forecast(
+    kpi: str,
+    cell_id: Optional[str] = None,
+    slice_type: Optional[str] = None,
+    history_points: int = 30,
+    forecast_points: int = 10,
+    model: str = "naive",
+):
+    if kpi not in FORECASTABLE_KPIS:
+        return {"error": f"Unsupported KPI. Use one of {list(FORECASTABLE_KPIS)}"}
+
+    conn = get_db()
+    clauses, params = [f"{kpi} IS NOT NULL"], []
+    if slice_type:
+        clauses.append("slice_type = ?")
+        params.append(slice_type)
+    if cell_id:
+        clauses.append("cell_id = ?")
+        params.append(cell_id)
+    where = "WHERE " + " AND ".join(clauses)
+    params.append(history_points)
+
+    rows = conn.execute(
+        f"""SELECT timestamp, {kpi} AS value
+            FROM predictions {where}
+            ORDER BY timestamp DESC LIMIT ?""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return {
+            "kpi": kpi, "historical": [], "forecast": [],
+            "threshold": None, "sla_status": "unknown", "predicted_value": None,
+        }
+
+    rows = list(reversed(rows))
+    history = [dict(r) for r in rows]
+    values = np.array([float(r["value"]) for r in history])
+
+    # Naive linear regression on index → value
+    from sklearn.linear_model import LinearRegression
+    X = np.arange(len(values)).reshape(-1, 1)
+    reg = LinearRegression().fit(X, values)
+    future_idx = np.arange(len(values), len(values) + forecast_points).reshape(-1, 1)
+    forecast_values = reg.predict(future_idx)
+
+    forecast_list = [
+        {"step": int(i + 1), "value": float(v)}
+        for i, v in enumerate(forecast_values)
+    ]
+    predicted_value = float(forecast_values[-1])
+
+    # Infer threshold from SLA table.
+    # Priority: explicit slice_type > slice derived from cell_id > worst-case across slices.
+    threshold = None
+    direction = FORECASTABLE_KPIS[kpi]["direction"]
+    effective_slice = slice_type
+    if not effective_slice and cell_id:
+        cell_slice_row = get_db().execute(
+            "SELECT slice_type FROM predictions WHERE cell_id = ? "
+            "ORDER BY ingested_at DESC LIMIT 1",
+            (cell_id,),
+        ).fetchone()
+        if cell_slice_row:
+            effective_slice = cell_slice_row["slice_type"]
+    if effective_slice and effective_slice in SLA_THRESHOLDS:
+        threshold = SLA_THRESHOLDS[effective_slice].get(kpi)
+    else:
+        vals = [t[kpi] for t in SLA_THRESHOLDS.values() if kpi in t]
+        threshold = (min(vals) if direction == "max" else max(vals)) if vals else None
+
+    sla_status = "unknown"
+    if threshold is not None:
+        if direction == "max":
+            sla_status = "breach_predicted" if predicted_value > threshold else "within_threshold"
+        else:
+            sla_status = "breach_predicted" if predicted_value < threshold else "within_threshold"
+
+    return {
+        "kpi": kpi,
+        "unit": FORECASTABLE_KPIS[kpi]["unit"],
+        "historical": history,
+        "forecast": forecast_list,
+        "threshold": threshold,
+        "predicted_value": round(predicted_value, 3),
+        "sla_status": sla_status,
+        "model": model,
+    }
 
 
 # ---------------------------------------------------------------------------

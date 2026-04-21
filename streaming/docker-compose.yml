@@ -81,11 +81,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      fastapi_server:
+        condition: service_started
     ports:
       - "8501:8501"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC_PREDICTIONS: predictions
+      API_BASE_URL: http://fastapi_server:8000
 
 volumes:
   fastapi_data:

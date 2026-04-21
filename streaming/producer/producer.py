@@ -35,19 +35,25 @@ def main():
 
     print(f"[Producer] Loading CSV from {CSV_FILE}", flush=True)
     df = pd.read_csv(CSV_FILE)
-    print(f"[Producer] Loaded {len(df)} rows. Streaming...", flush=True)
+    print(f"[Producer] Loaded {len(df)} rows. Streaming by timestamp...", flush=True)
 
-    for idx, (_, row) in enumerate(df.iterrows()):
-        message = row.to_dict()
-        message = {k: (None if pd.isna(v) else v) for k, v in message.items()}
-        producer.send(TOPIC_RAW, value=message)
+    sent = 0
+    ticks = 0
+    for ts, batch in df.groupby("timestamp", sort=True):
+        for _, row in batch.iterrows():
+            message = row.to_dict()
+            message = {k: (None if pd.isna(v) else v) for k, v in message.items()}
+            producer.send(TOPIC_RAW, value=message)
+            sent += 1
+
+        ticks += 1
+        if ticks % 50 == 0:
+            print(f"[Producer] Tick {ticks} (ts={ts}) — total sent {sent}", flush=True)
+
         time.sleep(STREAM_DELAY)
 
-        if (idx + 1) % 500 == 0:
-            print(f"[Producer] Sent {idx + 1} rows...", flush=True)
-
     producer.flush()
-    print(f"[Producer] Done. Streamed {len(df)} rows to topic '{TOPIC_RAW}'.", flush=True)
+    print(f"[Producer] Done. Streamed {sent} rows across {ticks} timestamps.", flush=True)
 
 
 if __name__ == "__main__":

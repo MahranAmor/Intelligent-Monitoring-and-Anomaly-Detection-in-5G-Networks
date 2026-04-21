@@ -152,6 +152,7 @@ def main():
             # Identity fields
             "timestamp": data.get("timestamp"),
             "cell_id": data.get("cell_id"),
+            "ue_id": data.get("ue_id"),
             "slice_type": data.get("slice_type"),
             "latitude": data.get("latitude"),
             "longitude": data.get("longitude"),

@@ -52,7 +52,15 @@ streaming/
 └── dashboard/
     ├── Dockerfile
     ├── requirements.txt
-    └── dashboard.py
+    ├── Home.py                  ← landing page
+    ├── .streamlit/config.toml   ← theme
+    ├── utils/                   ← FastAPI client + shared CSS
+    └── pages/
+        ├── 1_Network_Health.py
+        ├── 2_Anomaly_Diagnosis.py
+        ├── 3_KPI_Forecasting.py
+        ├── 4_SLA_Monitoring.py
+        └── 5_Live_Stream.py     ← legacy direct-Kafka view
 ```
 
 ## Setup & Run

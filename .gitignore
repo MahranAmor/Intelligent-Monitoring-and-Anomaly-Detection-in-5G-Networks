@@ -15,3 +15,6 @@ tmpclaude-*/
 Thumbs.db
 venv/
 *.dylib
+
+# Runtime streaming data (large CSVs produced/consumed locally)
+streaming/data/*.csv
